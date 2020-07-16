@@ -65,7 +65,8 @@ data State
   = State
       { stateNursery :: Maybe (NonEmptyCursor (Path Rel File)),
         stateSelectedFiles :: Maybe (NonEmpty (Path Rel File)),
-        stateButtons :: NonEmptyCursor ArchivistButton,
+        stateScanText :: TextCursor,
+        stateCombineText :: TextCursor,
         stateMode :: ArchivistMode,
         stateSelection :: Selection,
         stateScanProcess :: Maybe ScanProcess,
@@ -97,7 +98,7 @@ data ArchivistButton
 data ArchivistMode = InsertMode | NormalMode
   deriving (Show, Eq)
 
-data Selection = NurserySelection | ButtonSelection
+data Selection = NurserySelection | ScanButtonSelection | CombineButtonSelection
   deriving (Show, Eq)
 
 data Selected = MayBeSelected | NotSelected
@@ -154,12 +155,13 @@ buildInitialState Settings {..} = do
     State
       { stateNursery = mnec,
         stateSelectedFiles = Nothing,
-        stateButtons = makeNonEmptyCursor $ NE.fromList [ButtonScan emptyTextCursor, ButtonCombine emptyTextCursor],
+        stateScanText = emptyTextCursor,
+        stateCombineText = emptyTextCursor,
         stateMode = NormalMode,
         stateSelection =
           if isJust mnec
             then NurserySelection
-            else ButtonSelection,
+            else ScanButtonSelection,
         stateScanProcess = Nothing,
         stateError = Nothing
       }
@@ -173,14 +175,14 @@ drawTui State {..} =
           ],
           [vLimit 3 $ padAll 1 $ withDefAttr errAttr $ str e | e <- maybeToList stateError],
           [vLimitPercent 25 $ scanProcessWidget sp | sp <- maybeToList stateScanProcess],
-          [vLimit 5 $ buttonsWidget (selectedIf (stateSelection == ButtonSelection)) stateMode stateButtons],
-          [hBox [str (show stateSelection), str " ", str (show stateMode)] | debug],
-          [strWrap (show stateButtons) | debug]
+          [ vLimit 5 $
+              hBox
+                [ scanButtonWidget (selectedIf (stateSelection == ScanButtonSelection)) stateMode stateScanText,
+                  combineButtonWidget (selectedIf (stateSelection == CombineButtonSelection)) stateMode stateScanText
+                ]
+          ]
         ]
   ]
-
-debug :: Bool
-debug = False
 
 nurseryWidget :: Selected -> Maybe (NonEmptyCursor (Path Rel File)) -> Maybe (NonEmpty (Path Rel File)) -> Widget n
 nurseryWidget s nec ne = case mRightPart ne of
@@ -201,31 +203,31 @@ nurseryWidget s nec ne = case mRightPart ne of
               _ -> withDefAttr otherAttr $ str $ fromRelFile rf
           ]
 
-buttonsWidget :: Selected -> ArchivistMode -> NonEmptyCursor ArchivistButton -> Widget ResourceName
-buttonsWidget s m = horizontalNonEmptyCursorWidget (go NotSelected) (go s) (go NotSelected)
-  where
-    go :: Selected -> ArchivistButton -> Widget ResourceName
-    go s ab = padAll 1 . border . select s $ case ab of
-      ButtonScan tc ->
-        hBox
-          [ str "Scan:",
-            padLeftRight 1 $
-              case s of
-                MayBeSelected -> case m of
-                  NormalMode -> textCursorWidget tc
-                  InsertMode -> selectedTextCursorWidget ButtonTextCursor tc
-                NotSelected -> textCursorWidget tc
-          ]
-      ButtonCombine tc ->
-        hBox
-          [ str "Combine:",
-            padLeftRight 1 $
-              case s of
-                MayBeSelected -> case m of
-                  NormalMode -> textCursorWidget tc
-                  InsertMode -> selectedTextCursorWidget ButtonTextCursor tc
-                NotSelected -> textCursorWidget tc
-          ]
+scanButtonWidget :: Selected -> ArchivistMode -> TextCursor -> Widget ResourceName
+scanButtonWidget s m tc =
+  padAll 1 . border . select s $
+    hBox
+      [ str "Scan:",
+        padLeftRight 1 $
+          case s of
+            MayBeSelected -> case m of
+              NormalMode -> textCursorWidget tc
+              InsertMode -> selectedTextCursorWidget ButtonTextCursor tc
+            NotSelected -> textCursorWidget tc
+      ]
+
+combineButtonWidget :: Selected -> ArchivistMode -> TextCursor -> Widget ResourceName
+combineButtonWidget s m tc =
+  padAll 1 . border . select s $
+    hBox
+      [ str "Combine:",
+        padLeftRight 1 $
+          case s of
+            MayBeSelected -> case m of
+              NormalMode -> textCursorWidget tc
+              InsertMode -> selectedTextCursorWidget ButtonTextCursor tc
+            NotSelected -> textCursorWidget tc
+      ]
 
 scanProcessWidget :: ScanProcess -> Widget ResourceName
 scanProcessWidget ScanProcess {..} =
@@ -248,6 +250,19 @@ handleTuiEvent sets s be =
         VtyEvent vtye ->
           let setSelection sel = continue $ s {stateSelection = sel}
               setMode m = continue $ s {stateMode = m}
+              handleTextCursor set tc te =
+                let modTC func = continue $ set s $ func tc
+                    modTCM func = modTC $ \tc -> fromMaybe tc $ func tc
+                    modTCMDOU func = modTCM $ dullMDelete . func
+                 in case vtye of
+                      EvKey KEsc _ -> setMode NormalMode
+                      EvKey KLeft _ -> modTCM textCursorSelectPrev
+                      EvKey KRight _ -> modTCM textCursorSelectNext
+                      EvKey KBS _ -> modTCMDOU textCursorRemove
+                      EvKey KDel _ -> modTCMDOU textCursorDelete
+                      EvKey (KChar '\t') [] -> setSelection NurserySelection
+                      EvKey (KChar c) _ -> modTCM $ textCursorInsert c
+                      _ -> continue s
            in case stateSelection s of
                 NurserySelection ->
                   let modMNurseryM func = continue $ s {stateNursery = func (stateNursery s)}
@@ -257,8 +272,8 @@ handleTuiEvent sets s be =
                       mcf = nonEmptyCursorCurrent <$> stateNursery s
                    in case vtye of
                         EvKey (KChar 'q') [] -> halt s
-                        EvKey (KChar 's') [] -> setSelection ButtonSelection
-                        EvKey (KChar 'c') [] -> setSelection ButtonSelection
+                        EvKey (KChar 's') [] -> setSelection ScanButtonSelection
+                        EvKey (KChar 'c') [] -> setSelection CombineButtonSelection
                         EvKey (KChar 'p') [] -> do
                           liftIO $ convertToPdfs (setNurseryDir sets)
                           refreshNursery sets s >>= continue
@@ -267,7 +282,7 @@ handleTuiEvent sets s be =
                         EvKey (KChar 'j') [] -> modNurseryM nonEmptyCursorSelectNext
                         EvKey KUp [] -> modNurseryM nonEmptyCursorSelectPrev
                         EvKey (KChar 'k') [] -> modNurseryM nonEmptyCursorSelectPrev
-                        EvKey (KChar '\t') [] -> setSelection ButtonSelection
+                        EvKey (KChar '\t') [] -> setSelection ScanButtonSelection
                         EvKey (KChar 'D') [] -> case mcf of
                           Nothing -> err "No file to delete"
                           Just rf -> do
@@ -301,66 +316,52 @@ handleTuiEvent sets s be =
                                       else s {stateSelectedFiles = Just $ ne <> (cf :| [])}
                                 else err "Cannot select a non-pdf file."
                         _ -> continue s
-                ButtonSelection ->
-                  let bs = stateButtons s
-                      cb = nonEmptyCursorCurrent bs
-                      modButtons func = continue $ s {stateButtons = func bs}
-                      modButtonsM func = modButtons $ \nec -> fromMaybe nec $ func nec
-                   in case stateMode s of
-                        NormalMode -> case vtye of
-                          EvKey (KChar 'q') [] -> halt s
-                          EvKey (KChar 'r') [] -> refreshNursery sets s >>= continue
-                          EvKey KLeft [] -> modButtonsM nonEmptyCursorSelectPrev
-                          EvKey (KChar 'h') [] -> modButtonsM nonEmptyCursorSelectPrev
-                          EvKey KRight [] -> modButtonsM nonEmptyCursorSelectNext
-                          EvKey (KChar 'l') [] -> modButtonsM nonEmptyCursorSelectNext
-                          EvKey (KChar '\t') [] -> setSelection NurserySelection
-                          EvKey (KChar 'i') [] -> setMode InsertMode
-                          EvKey (KChar 'a') [] -> setMode InsertMode
-                          _ -> continue s
-                        InsertMode ->
-                          let handleTextCursor b tc te =
-                                let modTC func = do
-                                      let b' = b $ func tc
-                                      modButtons (nonEmptyCursorElemL .~ b')
-                                    modTCM func = modTC $ \tc -> fromMaybe tc $ func tc
-                                    modTCMDOU func = modTCM $ dullMDelete . func
-                                 in case vtye of
-                                      EvKey KEsc _ -> setMode NormalMode
-                                      EvKey KLeft _ -> modTCM textCursorSelectPrev
-                                      EvKey KRight _ -> modTCM textCursorSelectNext
-                                      EvKey KBS _ -> modTCMDOU textCursorRemove
-                                      EvKey KDel _ -> modTCMDOU textCursorDelete
-                                      EvKey (KChar '\t') [] -> setSelection NurserySelection
-                                      EvKey (KChar c) _ -> modTCM $ textCursorInsert c
-                                      _ -> continue s
-                           in case cb of
-                                ButtonScan tc -> case vtye of
-                                  EvKey KEnter [] -> case stateScanProcess s of
-                                    Nothing -> do
-                                      case parseRelFile $ T.unpack $ rebuildTextCursor tc of
-                                        Nothing -> err "Not a valid filename to scan."
-                                        Just rf ->
-                                          if anyInTheWay (stateNursery s) rf
-                                            then err "There are already files in the way."
-                                            else do
-                                              sp <- liftIO (startBatchScan sets rf)
-                                              s' <- refreshNursery sets $ s {stateScanProcess = Just sp}
-                                              continue s'
-                                    _ -> err "A scan has already started"
-                                  _ -> handleTextCursor ButtonScan tc vtye
-                                ButtonCombine tc ->
-                                  case vtye of
-                                    EvKey KEnter [] ->
-                                      case stateSelectedFiles s of
-                                        Nothing -> err "No selected files to combine"
-                                        Just ne ->
-                                          case parseRelFile (T.unpack (rebuildTextCursor tc)) >>= replaceExtension ".pdf" of
-                                            Nothing -> err "Not a valid file to combine to"
-                                            Just rf -> do
-                                              liftIO $ combineFiles sets rf ne
-                                              refreshNursery sets s >>= continue
-                                    _ -> handleTextCursor ButtonCombine tc vtye
+                ScanButtonSelection -> case stateMode s of
+                  NormalMode -> case vtye of
+                    EvKey (KChar 'q') [] -> halt s
+                    EvKey (KChar 'r') [] -> refreshNursery sets s >>= continue
+                    EvKey (KChar '\t') [] -> setSelection NurserySelection
+                    EvKey (KChar 'i') [] -> setMode InsertMode
+                    EvKey (KChar 'a') [] -> setMode InsertMode
+                    EvKey (KChar 'n') [] -> setSelection NurserySelection
+                    EvKey (KChar 'c') [] -> setSelection CombineButtonSelection
+                    _ -> continue s
+                  InsertMode ->
+                    case vtye of
+                      EvKey KEnter [] -> case stateScanProcess s of
+                        Nothing -> do
+                          case parseRelFile $ T.unpack $ rebuildTextCursor $ stateScanText s of
+                            Nothing -> err "Not a valid filename to scan."
+                            Just rf ->
+                              if anyInTheWay (stateNursery s) rf
+                                then err "There are already files in the way."
+                                else do
+                                  sp <- liftIO (startBatchScan sets rf)
+                                  s' <- refreshNursery sets $ s {stateScanProcess = Just sp}
+                                  continue s'
+                        _ -> err "A scan has already started"
+                      _ -> handleTextCursor (\s tc' -> s {stateScanText = tc'}) (stateScanText s) vtye
+                CombineButtonSelection -> case stateMode s of
+                  NormalMode -> case vtye of
+                    EvKey (KChar 'q') [] -> halt s
+                    EvKey (KChar 'r') [] -> refreshNursery sets s >>= continue
+                    EvKey (KChar '\t') [] -> setSelection NurserySelection
+                    EvKey (KChar 'i') [] -> setMode InsertMode
+                    EvKey (KChar 'a') [] -> setMode InsertMode
+                    EvKey (KChar 'n') [] -> setSelection NurserySelection
+                    EvKey (KChar 's') [] -> setSelection ScanButtonSelection
+                    _ -> continue s
+                  InsertMode -> case vtye of
+                    EvKey KEnter [] ->
+                      case stateSelectedFiles s of
+                        Nothing -> err "No selected files to combine"
+                        Just ne ->
+                          case parseRelFile (T.unpack (rebuildTextCursor $ stateCombineText s)) >>= replaceExtension ".pdf" of
+                            Nothing -> err "Not a valid file to combine to"
+                            Just rf -> do
+                              liftIO $ combineFiles sets rf ne
+                              refreshNursery sets s >>= continue
+                    _ -> handleTextCursor (\s tc' -> s {stateCombineText = tc'}) (stateCombineText s) vtye
         _ -> continue s
 
 refreshNursery :: Settings -> State -> EventM n State
