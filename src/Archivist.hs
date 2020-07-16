@@ -78,13 +78,13 @@ data ArchivistEvent
   deriving (Show, Eq)
 
 data ResourceName
-  = ScanButtonTextCursor
+  = ButtonTextCursor
   | OutputViewport
   deriving (Show, Eq, Ord)
 
 data ArchivistButton
   = ButtonScan TextCursor
-  | ButtonCombine
+  | ButtonCombine TextCursor
   deriving (Show, Eq)
 
 data ArchivistMode = InsertMode | NormalMode
@@ -128,7 +128,7 @@ buildInitialState Settings {..} = do
   pure
     State
       { stateNursery = makeNonEmptyCursor <$> (mfs >>= NE.nonEmpty),
-        stateButtons = makeNonEmptyCursor $ NE.fromList [ButtonScan emptyTextCursor, ButtonCombine],
+        stateButtons = makeNonEmptyCursor $ NE.fromList [ButtonScan emptyTextCursor, ButtonCombine emptyTextCursor],
         stateMode = NormalMode,
         stateSelection = ButtonSelection,
         stateScanProcess = Nothing
@@ -171,10 +171,19 @@ buttonsWidget s m = horizontalNonEmptyCursorWidget (go NotSelected) (go s) (go N
               case s of
                 MayBeSelected -> case m of
                   NormalMode -> textCursorWidget tc
-                  InsertMode -> selectedTextCursorWidget ScanButtonTextCursor tc
+                  InsertMode -> selectedTextCursorWidget ButtonTextCursor tc
                 NotSelected -> textCursorWidget tc
           ]
-      ButtonCombine -> str "Combine"
+      ButtonCombine tc ->
+        hBox
+          [ str "Combine: ",
+            padLeftRight 1 $
+              case s of
+                MayBeSelected -> case m of
+                  NormalMode -> textCursorWidget tc
+                  InsertMode -> selectedTextCursorWidget ButtonTextCursor tc
+                NotSelected -> textCursorWidget tc
+          ]
 
 scanProcessWidget :: ScanProcess -> Widget ResourceName
 scanProcessWidget ScanProcess {..} =
@@ -237,24 +246,26 @@ handleTuiEvent sets s be =
                       EvKey KRight [] -> modButtonsM nonEmptyCursorSelectNext
                       EvKey (KChar 'l') [] -> modButtonsM nonEmptyCursorSelectNext
                       EvKey (KChar '\t') [] -> setSelection NurserySelection
-                      EvKey (KChar 'i') [] -> case cb of
-                        ButtonScan _ -> setMode InsertMode
-                        ButtonCombine -> continue s
+                      EvKey (KChar 'i') [] -> setMode InsertMode
+                      EvKey (KChar 'a') [] -> setMode InsertMode
                       _ -> continue s
-                    InsertMode -> case cb of
-                      ButtonScan tc ->
-                        let modTC func = do
-                              let b' = ButtonScan $ func tc
-                              modButtons (nonEmptyCursorElemL .~ b')
-                            modTCM func = modTC $ \tc -> fromMaybe tc $ func tc
-                            modTCMDOU func = modTCM $ dullMDelete . func
-                         in case vtye of
-                              EvKey KEsc _ -> setMode NormalMode
-                              EvKey KLeft _ -> modTCM textCursorSelectPrev
-                              EvKey KRight _ -> modTCM textCursorSelectNext
-                              EvKey KBS _ -> modTCMDOU textCursorRemove
-                              EvKey KDel _ -> modTCMDOU textCursorDelete
-                              EvKey (KChar c) _ -> modTCM $ textCursorInsert c
+                    InsertMode ->
+                      let handleTextCursor b tc te =
+                            let modTC func = do
+                                  let b' = b $ func tc
+                                  modButtons (nonEmptyCursorElemL .~ b')
+                                modTCM func = modTC $ \tc -> fromMaybe tc $ func tc
+                                modTCMDOU func = modTCM $ dullMDelete . func
+                             in case vtye of
+                                  EvKey KEsc _ -> setMode NormalMode
+                                  EvKey KLeft _ -> modTCM textCursorSelectPrev
+                                  EvKey KRight _ -> modTCM textCursorSelectNext
+                                  EvKey KBS _ -> modTCMDOU textCursorRemove
+                                  EvKey KDel _ -> modTCMDOU textCursorDelete
+                                  EvKey (KChar c) _ -> modTCM $ textCursorInsert c
+                                  _ -> continue s
+                       in case cb of
+                            ButtonScan tc -> case vtye of
                               EvKey KEnter [] -> case stateScanProcess s of
                                 Nothing -> do
                                   case parseRelFile $ T.unpack $ rebuildTextCursor tc of
@@ -267,11 +278,11 @@ handleTuiEvent sets s be =
                                           s' <- refreshNursery sets $ s {stateScanProcess = Just sp}
                                           continue s'
                                 _ -> continue s
-                              _ -> continue s
-                      ButtonCombine ->
-                        case vtye of
-                          EvKey KEsc _ -> setMode NormalMode
-                          _ -> continue s
+                              _ -> handleTextCursor ButtonScan tc vtye
+                            ButtonCombine tc ->
+                              case vtye of
+                                EvKey KEnter [] -> continue s
+                                _ -> handleTextCursor ButtonCombine tc vtye
     _ -> continue s
 
 refreshNursery :: Settings -> State -> EventM n State
