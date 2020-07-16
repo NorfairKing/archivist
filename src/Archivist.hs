@@ -25,6 +25,7 @@ import qualified Data.ByteString as SB
 import Data.ByteString (ByteString)
 import Data.List
 import qualified Data.List.NonEmpty as NE
+import Data.List.NonEmpty (NonEmpty (..))
 import Data.Maybe
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -60,10 +61,12 @@ data Settings
 data State
   = State
       { stateNursery :: Maybe (NonEmptyCursor (Path Rel File)),
+        stateSelectedFiles :: Maybe (NonEmpty (Path Rel File)),
         stateButtons :: NonEmptyCursor ArchivistButton,
         stateMode :: ArchivistMode,
         stateSelection :: Selection,
-        stateScanProcess :: Maybe ScanProcess
+        stateScanProcess :: Maybe ScanProcess,
+        stateError :: Maybe String
       }
 
 data ScanProcess
@@ -107,7 +110,15 @@ tuiApp sets =
       appChooseCursor = showFirstCursor,
       appHandleEvent = handleTuiEvent sets,
       appStartEvent = pure,
-      appAttrMap = const $ attrMap defAttr [("selected", fg green)]
+      appAttrMap =
+        const $
+          attrMap
+            defAttr
+            [ (selectedAttr, fg green),
+              (pdfAttr, fg blue),
+              (otherAttr, fg yellow),
+              (errAttr, fg red)
+            ]
     }
 
 select :: Selected -> Widget n -> Widget n
@@ -122,33 +133,58 @@ selectedIf False = NotSelected
 selectedAttr :: AttrName
 selectedAttr = "selected"
 
+pdfAttr :: AttrName
+pdfAttr = "pdf"
+
+otherAttr :: AttrName
+otherAttr = "other"
+
+errAttr :: AttrName
+errAttr = "error"
+
 buildInitialState :: Settings -> IO State
 buildInitialState Settings {..} = do
   mfs <- forgivingAbsence $ snd <$> listDirRecurRel setNurseryDir
+  let mnec = makeNonEmptyCursor <$> (mfs >>= NE.nonEmpty)
   pure
     State
-      { stateNursery = makeNonEmptyCursor <$> (mfs >>= NE.nonEmpty),
+      { stateNursery = mnec,
+        stateSelectedFiles = Nothing,
         stateButtons = makeNonEmptyCursor $ NE.fromList [ButtonScan emptyTextCursor, ButtonCombine emptyTextCursor],
         stateMode = NormalMode,
-        stateSelection = ButtonSelection,
-        stateScanProcess = Nothing
+        stateSelection =
+          if isJust mnec
+            then NurserySelection
+            else ButtonSelection,
+        stateScanProcess = Nothing,
+        stateError = Nothing
       }
 
 drawTui :: State -> [Widget ResourceName]
 drawTui State {..} =
   [ vBox $
       concat
-        [ [ padBottom Max $ padRight Max $ padAll 1 $ nurseryWidget (selectedIf (stateSelection == NurserySelection)) stateNursery,
+        [ [ padBottom Max $ padRight Max $ padAll 1 $ nurseryWidget (selectedIf (stateSelection == NurserySelection)) stateNursery stateSelectedFiles,
             hBorder
           ],
+          [vLimit 3 $ padAll 1 $ withDefAttr errAttr $ str e | e <- maybeToList stateError],
           [vLimitPercent 25 $ scanProcessWidget sp | sp <- maybeToList stateScanProcess],
-          [vLimit 5 $ buttonsWidget (selectedIf (stateSelection == ButtonSelection)) stateMode stateButtons]
+          [vLimit 5 $ buttonsWidget (selectedIf (stateSelection == ButtonSelection)) stateMode stateButtons],
+          [hBox [str (show stateSelection), str " ", str (show stateMode)] | debug],
+          [strWrap (show stateButtons) | debug]
         ]
   ]
 
-nurseryWidget :: Selected -> Maybe (NonEmptyCursor (Path Rel File)) -> Widget n
-nurseryWidget s = maybe (str "No files") $ verticalNonEmptyCursorWidget (go NotSelected) (go s) (go NotSelected)
+debug :: Bool
+debug = False
+
+nurseryWidget :: Selected -> Maybe (NonEmptyCursor (Path Rel File)) -> Maybe (NonEmpty (Path Rel File)) -> Widget n
+nurseryWidget s nec ne = case mRightPart ne of
+  Nothing -> padLeftRight 1 leftPart
+  Just rightPart -> hBox [padLeftRight 1 $ hLimitPercent 75 $ padRight Max $ leftPart, vBorder, padLeftRight 1 rightPart]
   where
+    leftPart = maybe (str "No files") (verticalNonEmptyCursorWidget (go NotSelected) (go s) (go NotSelected)) nec
+    mRightPart = fmap $ \ne -> vBox $ map (str . fromRelFile) (NE.toList ne)
     go :: Selected -> Path Rel File -> Widget n
     go s rf =
       select s $
@@ -156,7 +192,9 @@ nurseryWidget s = maybe (str "No files") $ verticalNonEmptyCursorWidget (go NotS
           [ str $ case s of
               MayBeSelected -> "❯ "
               NotSelected -> "- ",
-            str (fromRelFile rf)
+            case fileExtension rf of
+              Just ".pdf" -> withDefAttr pdfAttr $ str $ fromRelFile rf
+              _ -> withDefAttr otherAttr $ str $ fromRelFile rf
           ]
 
 buttonsWidget :: Selected -> ArchivistMode -> NonEmptyCursor ArchivistButton -> Widget ResourceName
@@ -166,7 +204,7 @@ buttonsWidget s m = horizontalNonEmptyCursorWidget (go NotSelected) (go s) (go N
     go s ab = padAll 1 . border . select s $ case ab of
       ButtonScan tc ->
         hBox
-          [ str "Scan: ",
+          [ str "Scan:",
             padLeftRight 1 $
               case s of
                 MayBeSelected -> case m of
@@ -176,7 +214,7 @@ buttonsWidget s m = horizontalNonEmptyCursorWidget (go NotSelected) (go s) (go N
           ]
       ButtonCombine tc ->
         hBox
-          [ str "Combine: ",
+          [ str "Combine:",
             padLeftRight 1 $
               case s of
                 MayBeSelected -> case m of
@@ -196,94 +234,118 @@ scanProcessWidget ScanProcess {..} =
 
 handleTuiEvent :: Settings -> State -> BrickEvent n ArchivistEvent -> EventM n (Next State)
 handleTuiEvent sets s be =
-  case be of
-    AppEvent ae -> case ae of
-      EventCheckProcess -> checkProcess s
-    VtyEvent vtye ->
-      let setSelection sel = continue $ s {stateSelection = sel}
-          setMode m = continue $ s {stateMode = m}
-       in case stateSelection s of
-            NurserySelection ->
-              let modMNurseryM func = continue $ s {stateNursery = func (stateNursery s)}
-                  modNursery func = modMNurseryM $ fmap func
-                  -- modNurseryDOU func = modMNurseryM $ \mnec -> mnec >>= (dullDelete . func)
-                  modNurseryM func = modNursery $ \nec -> fromMaybe nec $ func nec
-                  mcf = nonEmptyCursorCurrent <$> stateNursery s
-               in case vtye of
-                    EvKey (KChar 'q') [] -> halt s
-                    EvKey (KChar 'c') [] -> case mcf of
-                      Nothing -> continue s
-                      Just rf ->
-                        if (fileExtension rf == Just ".pdf")
-                          then continue s
-                          else do
-                            liftIO $ convertFile $ setNurseryDir sets </> rf
-                            refreshNursery sets s >>= continue
-                    EvKey (KChar 'r') [] -> refreshNursery sets s >>= continue
-                    EvKey KDown [] -> modNurseryM nonEmptyCursorSelectNext
-                    EvKey (KChar 'j') [] -> modNurseryM nonEmptyCursorSelectNext
-                    EvKey KUp [] -> modNurseryM nonEmptyCursorSelectPrev
-                    EvKey (KChar 'k') [] -> modNurseryM nonEmptyCursorSelectPrev
-                    EvKey (KChar '\t') [] -> setSelection ButtonSelection
-                    EvKey (KChar 'd') [] -> case mcf of
-                      Nothing -> continue s
-                      Just rf -> do
-                        let af = setNurseryDir sets </> rf
-                        ignoringAbsence $ removeFile af
-                        refreshNursery sets s >>= continue
-                    _ -> continue s
-            ButtonSelection ->
-              let bs = stateButtons s
-                  cb = nonEmptyCursorCurrent bs
-                  modButtons func = continue $ s {stateButtons = func bs}
-                  modButtonsM func = modButtons $ \nec -> fromMaybe nec $ func nec
-               in case stateMode s of
-                    NormalMode -> case vtye of
-                      EvKey (KChar 'q') [] -> halt s
-                      EvKey (KChar 'r') [] -> refreshNursery sets s >>= continue
-                      EvKey KLeft [] -> modButtonsM nonEmptyCursorSelectPrev
-                      EvKey (KChar 'h') [] -> modButtonsM nonEmptyCursorSelectPrev
-                      EvKey KRight [] -> modButtonsM nonEmptyCursorSelectNext
-                      EvKey (KChar 'l') [] -> modButtonsM nonEmptyCursorSelectNext
-                      EvKey (KChar '\t') [] -> setSelection NurserySelection
-                      EvKey (KChar 'i') [] -> setMode InsertMode
-                      EvKey (KChar 'a') [] -> setMode InsertMode
-                      _ -> continue s
-                    InsertMode ->
-                      let handleTextCursor b tc te =
-                            let modTC func = do
-                                  let b' = b $ func tc
-                                  modButtons (nonEmptyCursorElemL .~ b')
-                                modTCM func = modTC $ \tc -> fromMaybe tc $ func tc
-                                modTCMDOU func = modTCM $ dullMDelete . func
-                             in case vtye of
-                                  EvKey KEsc _ -> setMode NormalMode
-                                  EvKey KLeft _ -> modTCM textCursorSelectPrev
-                                  EvKey KRight _ -> modTCM textCursorSelectNext
-                                  EvKey KBS _ -> modTCMDOU textCursorRemove
-                                  EvKey KDel _ -> modTCMDOU textCursorDelete
-                                  EvKey (KChar c) _ -> modTCM $ textCursorInsert c
-                                  _ -> continue s
-                       in case cb of
-                            ButtonScan tc -> case vtye of
-                              EvKey KEnter [] -> case stateScanProcess s of
-                                Nothing -> do
-                                  case parseRelFile $ T.unpack $ rebuildTextCursor tc of
-                                    Nothing -> continue s
-                                    Just rf ->
-                                      if anyInTheWay (stateNursery s) rf
-                                        then continue s
-                                        else do
-                                          sp <- liftIO (startBatchScan sets rf)
-                                          s' <- refreshNursery sets $ s {stateScanProcess = Just sp}
-                                          continue s'
-                                _ -> continue s
-                              _ -> handleTextCursor ButtonScan tc vtye
-                            ButtonCombine tc ->
-                              case vtye of
-                                EvKey KEnter [] -> continue s
-                                _ -> handleTextCursor ButtonCombine tc vtye
-    _ -> continue s
+  let err str = continue $ s {stateError = Just str}
+   in case be of
+        AppEvent ae -> case ae of
+          EventCheckProcess -> checkProcess s
+        VtyEvent vtye ->
+          let setSelection sel = continue $ s {stateSelection = sel}
+              setMode m = continue $ s {stateMode = m}
+           in case stateSelection s of
+                NurserySelection ->
+                  let modMNurseryM func = continue $ s {stateNursery = func (stateNursery s)}
+                      modNursery func = modMNurseryM $ fmap func
+                      modNurseryDOU func = modMNurseryM $ \mnec -> mnec >>= (dullDelete . func)
+                      modNurseryM func = modNursery $ \nec -> fromMaybe nec $ func nec
+                      mcf = nonEmptyCursorCurrent <$> stateNursery s
+                   in case vtye of
+                        EvKey (KChar 'q') [] -> halt s
+                        EvKey (KChar 's') [] -> setSelection ButtonSelection
+                        EvKey (KChar 'c') [] -> setSelection ButtonSelection
+                        EvKey (KChar 'p') [] -> case mcf of
+                          Nothing -> err "No file to convert to a pdf"
+                          Just rf ->
+                            if (fileExtension rf == Just ".pdf")
+                              then err "The file to convert is already a pdf"
+                              else do
+                                liftIO $ convertFile $ setNurseryDir sets </> rf
+                                refreshNursery sets s >>= continue
+                        EvKey (KChar 'r') [] -> refreshNursery sets s >>= continue
+                        EvKey KDown [] -> modNurseryM nonEmptyCursorSelectNext
+                        EvKey (KChar 'j') [] -> modNurseryM nonEmptyCursorSelectNext
+                        EvKey KUp [] -> modNurseryM nonEmptyCursorSelectPrev
+                        EvKey (KChar 'k') [] -> modNurseryM nonEmptyCursorSelectPrev
+                        EvKey (KChar '\t') [] -> setSelection ButtonSelection
+                        EvKey (KChar 'd') [] -> case mcf of
+                          Nothing -> err "No file to delete"
+                          Just rf -> do
+                            let af = setNurseryDir sets </> rf
+                            ignoringAbsence $ removeFile af
+                            modNurseryDOU nonEmptyCursorRemoveElem
+                        EvKey KEnter [] ->
+                          case mcf of
+                            Nothing -> err "No selected files."
+                            Just cf ->
+                              if fileExtension cf == Just ".pdf"
+                                then continue $ case stateSelectedFiles s of
+                                  Nothing -> s {stateSelectedFiles = Just $ cf :| []}
+                                  Just ne ->
+                                    if cf `elem` NE.toList ne
+                                      then s {stateSelectedFiles = NE.nonEmpty $ NE.filter (/= cf) ne}
+                                      else s {stateSelectedFiles = Just $ NE.cons cf ne}
+                                else err "Cannot select a non-pdf file."
+                        _ -> continue s
+                ButtonSelection ->
+                  let bs = stateButtons s
+                      cb = nonEmptyCursorCurrent bs
+                      modButtons func = continue $ s {stateButtons = func bs}
+                      modButtonsM func = modButtons $ \nec -> fromMaybe nec $ func nec
+                   in case stateMode s of
+                        NormalMode -> case vtye of
+                          EvKey (KChar 'q') [] -> halt s
+                          EvKey (KChar 'r') [] -> refreshNursery sets s >>= continue
+                          EvKey KLeft [] -> modButtonsM nonEmptyCursorSelectPrev
+                          EvKey (KChar 'h') [] -> modButtonsM nonEmptyCursorSelectPrev
+                          EvKey KRight [] -> modButtonsM nonEmptyCursorSelectNext
+                          EvKey (KChar 'l') [] -> modButtonsM nonEmptyCursorSelectNext
+                          EvKey (KChar '\t') [] -> setSelection NurserySelection
+                          EvKey (KChar 'i') [] -> setMode InsertMode
+                          EvKey (KChar 'a') [] -> setMode InsertMode
+                          _ -> continue s
+                        InsertMode ->
+                          let handleTextCursor b tc te =
+                                let modTC func = do
+                                      let b' = b $ func tc
+                                      modButtons (nonEmptyCursorElemL .~ b')
+                                    modTCM func = modTC $ \tc -> fromMaybe tc $ func tc
+                                    modTCMDOU func = modTCM $ dullMDelete . func
+                                 in case vtye of
+                                      EvKey KEsc _ -> setMode NormalMode
+                                      EvKey KLeft _ -> modTCM textCursorSelectPrev
+                                      EvKey KRight _ -> modTCM textCursorSelectNext
+                                      EvKey KBS _ -> modTCMDOU textCursorRemove
+                                      EvKey KDel _ -> modTCMDOU textCursorDelete
+                                      EvKey (KChar '\t') [] -> setSelection NurserySelection
+                                      EvKey (KChar c) _ -> modTCM $ textCursorInsert c
+                                      _ -> continue s
+                           in case cb of
+                                ButtonScan tc -> case vtye of
+                                  EvKey KEnter [] -> case stateScanProcess s of
+                                    Nothing -> do
+                                      case parseRelFile $ T.unpack $ rebuildTextCursor tc of
+                                        Nothing -> err "Not a valid filename to scan."
+                                        Just rf ->
+                                          if anyInTheWay (stateNursery s) rf
+                                            then err "There are already files in the way."
+                                            else do
+                                              sp <- liftIO (startBatchScan sets rf)
+                                              s' <- refreshNursery sets $ s {stateScanProcess = Just sp}
+                                              continue s'
+                                    _ -> err "A scan has already started"
+                                  _ -> handleTextCursor ButtonScan tc vtye
+                                ButtonCombine tc ->
+                                  case vtye of
+                                    EvKey KEnter [] ->
+                                      case stateSelectedFiles s of
+                                        Nothing -> err "No selected files to combine"
+                                        Just ne ->
+                                          case parseRelFile (T.unpack (rebuildTextCursor tc)) >>= replaceExtension ".pdf" of
+                                            Nothing -> err "Not a valid file to combine to"
+                                            Just rf -> do
+                                              liftIO $ combineFiles sets rf ne
+                                              refreshNursery sets s >>= continue
+                                    _ -> handleTextCursor ButtonCombine tc vtye
+        _ -> continue s
 
 refreshNursery :: Settings -> State -> EventM n State
 refreshNursery Settings {..} s = do
@@ -383,3 +445,11 @@ convertFile inf = do
   case replaceExtension ".pdf" inf of
     Nothing -> pure ()
     Just outf -> void $ runProcess $ proc "convert" [fromAbsFile inf, fromAbsFile outf]
+
+combineFiles :: Settings -> Path Rel File -> NonEmpty (Path Rel File) -> IO ()
+combineFiles Settings {..} outFile inFiles = do
+  let outAbsFile = setNurseryDir </> outFile
+      inAbsFiles = map (setNurseryDir </>) $ NE.toList inFiles
+  case inAbsFiles of
+    [inAbsFile] -> copyFile inAbsFile outAbsFile
+    _ -> void $ runProcess $ proc "pdfunite" $ map fromAbsFile inAbsFiles ++ [fromAbsFile outAbsFile]
