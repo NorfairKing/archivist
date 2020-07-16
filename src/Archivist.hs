@@ -17,9 +17,13 @@ import Control.Concurrent.Async
 import Control.Monad
 import Control.Monad.IO.Class
 import Cursor.Brick.List.NonEmpty
+import Cursor.Brick.Text
 import Cursor.Simple.List.NonEmpty
+import Cursor.Text
+import Cursor.Types
 import qualified Data.ByteString as SB
 import Data.ByteString (ByteString)
+import Data.List
 import qualified Data.List.NonEmpty as NE
 import Data.Maybe
 import qualified Data.Text as T
@@ -29,6 +33,7 @@ import Graphics.Vty as Vty
 import Graphics.Vty.Attributes
 import Graphics.Vty.Attributes.Color
 import Graphics.Vty.Input.Events
+import Lens.Micro
 import Path
 import Path.IO
 import System.IO
@@ -56,6 +61,7 @@ data State
   = State
       { stateNursery :: Maybe (NonEmptyCursor (Path Rel File)),
         stateButtons :: NonEmptyCursor ArchivistButton,
+        stateMode :: ArchivistMode,
         stateSelection :: Selection,
         stateScanProcess :: Maybe ScanProcess
       }
@@ -72,13 +78,17 @@ data ArchivistEvent
   deriving (Show, Eq)
 
 data ResourceName
-  = OutputViewport
+  = ScanButtonTextCursor
+  | OutputViewport
   deriving (Show, Eq, Ord)
 
 data ArchivistButton
-  = ButtonScan
+  = ButtonScan TextCursor
   | ButtonCombine
-  deriving (Show, Eq, Ord, Enum, Bounded)
+  deriving (Show, Eq)
+
+data ArchivistMode = InsertMode | NormalMode
+  deriving (Show, Eq)
 
 data Selection = NurserySelection | ButtonSelection
   deriving (Show, Eq)
@@ -118,7 +128,8 @@ buildInitialState Settings {..} = do
   pure
     State
       { stateNursery = makeNonEmptyCursor <$> (mfs >>= NE.nonEmpty),
-        stateButtons = makeNonEmptyCursor $ NE.fromList [minBound .. maxBound],
+        stateButtons = makeNonEmptyCursor $ NE.fromList [ButtonScan emptyTextCursor, ButtonCombine],
+        stateMode = NormalMode,
         stateSelection = ButtonSelection,
         stateScanProcess = Nothing
       }
@@ -131,7 +142,7 @@ drawTui State {..} =
             hBorder
           ],
           [vLimitPercent 25 $ scanProcessWidget sp | sp <- maybeToList stateScanProcess],
-          [vLimit 5 $ buttonsWidget (selectedIf (stateSelection == ButtonSelection)) stateButtons]
+          [vLimit 5 $ buttonsWidget (selectedIf (stateSelection == ButtonSelection)) stateMode stateButtons]
         ]
   ]
 
@@ -148,11 +159,22 @@ nurseryWidget s = maybe (str "No files") $ verticalNonEmptyCursorWidget (go NotS
             str (fromRelFile rf)
           ]
 
-buttonsWidget :: Selected -> NonEmptyCursor ArchivistButton -> Widget n
-buttonsWidget s = horizontalNonEmptyCursorWidget (go NotSelected) (go s) (go NotSelected)
+buttonsWidget :: Selected -> ArchivistMode -> NonEmptyCursor ArchivistButton -> Widget ResourceName
+buttonsWidget s m = horizontalNonEmptyCursorWidget (go NotSelected) (go s) (go NotSelected)
   where
-    go :: Selected -> ArchivistButton -> Widget n
-    go s = padAll 1 . border . select s . str . show
+    go :: Selected -> ArchivistButton -> Widget ResourceName
+    go s ab = padAll 1 . border . select s $ case ab of
+      ButtonScan tc ->
+        hBox
+          [ str "Scan: ",
+            padLeftRight 1 $
+              case s of
+                MayBeSelected -> case m of
+                  NormalMode -> textCursorWidget tc
+                  InsertMode -> selectedTextCursorWidget ScanButtonTextCursor tc
+                NotSelected -> textCursorWidget tc
+          ]
+      ButtonCombine -> str "Combine"
 
 scanProcessWidget :: ScanProcess -> Widget ResourceName
 scanProcessWidget ScanProcess {..} =
@@ -170,11 +192,14 @@ handleTuiEvent sets s be =
       EventCheckProcess -> checkProcess s
     VtyEvent vtye ->
       let setSelection sel = continue $ s {stateSelection = sel}
+          setMode m = continue $ s {stateMode = m}
        in case stateSelection s of
             NurserySelection ->
               let modMNurseryM func = continue $ s {stateNursery = func (stateNursery s)}
                   modNursery func = modMNurseryM $ fmap func
+                  -- modNurseryDOU func = modMNurseryM $ \mnec -> mnec >>= (dullDelete . func)
                   modNurseryM func = modNursery $ \nec -> fromMaybe nec $ func nec
+                  mcf = nonEmptyCursorCurrent <$> stateNursery s
                in case vtye of
                     EvKey (KChar 'q') [] -> halt s
                     EvKey (KChar 'r') [] -> refreshNursery sets s >>= continue
@@ -183,27 +208,62 @@ handleTuiEvent sets s be =
                     EvKey KUp [] -> modNurseryM nonEmptyCursorSelectPrev
                     EvKey (KChar 'k') [] -> modNurseryM nonEmptyCursorSelectPrev
                     EvKey (KChar '\t') [] -> setSelection ButtonSelection
+                    EvKey (KChar 'd') [] -> case mcf of
+                      Nothing -> continue s
+                      Just rf -> do
+                        let af = setNurseryDir sets </> rf
+                        ignoringAbsence $ removeFile af
+                        refreshNursery sets s >>= continue
                     _ -> continue s
             ButtonSelection ->
-              let modButtons func = continue $ s {stateButtons = func (stateButtons s)}
+              let bs = stateButtons s
+                  cb = nonEmptyCursorCurrent bs
+                  modButtons func = continue $ s {stateButtons = func bs}
                   modButtonsM func = modButtons $ \nec -> fromMaybe nec $ func nec
-               in case vtye of
-                    EvKey (KChar 'q') [] -> halt s
-                    EvKey (KChar 'r') [] -> refreshNursery sets s >>= continue
-                    EvKey KLeft [] -> modButtonsM nonEmptyCursorSelectPrev
-                    EvKey (KChar 'h') [] -> modButtonsM nonEmptyCursorSelectPrev
-                    EvKey KRight [] -> modButtonsM nonEmptyCursorSelectNext
-                    EvKey (KChar 'l') [] -> modButtonsM nonEmptyCursorSelectNext
-                    EvKey (KChar '\t') [] -> setSelection NurserySelection
-                    EvKey KEnter [] -> case nonEmptyCursorCurrent (stateButtons s) of
-                      ButtonScan -> case stateScanProcess s of
-                        Nothing -> do
-                          sp <- liftIO (startBatchScan sets)
-                          s' <- refreshNursery sets $ s {stateScanProcess = Just sp}
-                          continue s'
-                        _ -> continue s
+               in case stateMode s of
+                    NormalMode -> case vtye of
+                      EvKey (KChar 'q') [] -> halt s
+                      EvKey (KChar 'r') [] -> refreshNursery sets s >>= continue
+                      EvKey KLeft [] -> modButtonsM nonEmptyCursorSelectPrev
+                      EvKey (KChar 'h') [] -> modButtonsM nonEmptyCursorSelectPrev
+                      EvKey KRight [] -> modButtonsM nonEmptyCursorSelectNext
+                      EvKey (KChar 'l') [] -> modButtonsM nonEmptyCursorSelectNext
+                      EvKey (KChar '\t') [] -> setSelection NurserySelection
+                      EvKey (KChar 'i') [] -> case cb of
+                        ButtonScan _ -> setMode InsertMode
+                        ButtonCombine -> continue s
                       _ -> continue s
-                    _ -> continue s
+                    InsertMode -> case cb of
+                      ButtonScan tc ->
+                        let modTC func = do
+                              let b' = ButtonScan $ func tc
+                              modButtons (nonEmptyCursorElemL .~ b')
+                            modTCM func = modTC $ \tc -> fromMaybe tc $ func tc
+                            modTCMDOU func = modTCM $ dullMDelete . func
+                         in case vtye of
+                              EvKey KEsc _ -> setMode NormalMode
+                              EvKey KLeft _ -> modTCM textCursorSelectPrev
+                              EvKey KRight _ -> modTCM textCursorSelectNext
+                              EvKey KBS _ -> modTCMDOU textCursorRemove
+                              EvKey KDel _ -> modTCMDOU textCursorDelete
+                              EvKey (KChar c) _ -> modTCM $ textCursorInsert c
+                              EvKey KEnter [] -> case stateScanProcess s of
+                                Nothing -> do
+                                  case parseRelFile $ T.unpack $ rebuildTextCursor tc of
+                                    Nothing -> continue s
+                                    Just rf ->
+                                      if anyInTheWay (stateNursery s) rf
+                                        then continue s
+                                        else do
+                                          sp <- liftIO (startBatchScan sets rf)
+                                          s' <- refreshNursery sets $ s {stateScanProcess = Just sp}
+                                          continue s'
+                                _ -> continue s
+                              _ -> continue s
+                      ButtonCombine ->
+                        case vtye of
+                          EvKey KEsc _ -> setMode NormalMode
+                          _ -> continue s
     _ -> continue s
 
 refreshNursery :: Settings -> State -> EventM n State
@@ -216,8 +276,13 @@ refreshNursery Settings {..} s = do
 
 -- TODO make sure that the process is stopped
 
-startBatchScan :: Settings -> IO ScanProcess
-startBatchScan Settings {..} = do
+anyInTheWay :: Maybe (NonEmptyCursor (Path Rel File)) -> Path Rel File -> Bool
+anyInTheWay nursery rf =
+  let fs = maybe [] (NE.toList . rebuildNonEmptyCursor) nursery
+   in any (\f -> fromRelFile rf `isInfixOf` fromRelFile f) fs
+
+startBatchScan :: Settings -> Path Rel File -> IO ScanProcess
+startBatchScan Settings {..} rf = do
   let wd = setNurseryDir
       pc =
         setStdin nullStream
@@ -226,7 +291,7 @@ startBatchScan Settings {..} = do
           $ setWorkingDir (fromAbsDir wd)
           $ proc
             "scanimage"
-            [ "--batch=scan%d.pnm",
+            [ "--batch=" <> fromRelFile rf <> "%d.pnm",
               "--batch-print",
               "-x",
               "210mm",

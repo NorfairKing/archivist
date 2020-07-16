@@ -13,6 +13,7 @@ library:
   - cursor
   - cursor-brick
   - directory
+  - microlens
   - path
   - path-io
   - text

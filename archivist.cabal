@@ -4,7 +4,7 @@ cabal-version: 1.12
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: 298d766f888a319e90b571693ec979e697d57c384caa31fb8134eb0daba2562c
+-- hash: 5ee0a38e0b7fd4679034e32743d346b09f95857c508ceb214fb890715ff39e97
 
 name:           archivist
 version:        0.0.0.0
@@ -33,6 +33,7 @@ library
     , cursor
     , cursor-brick
     , directory
+    , microlens
     , path
     , path-io
     , text
