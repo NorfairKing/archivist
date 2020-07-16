@@ -6,14 +6,18 @@ license:             MIT
 library:
   source-dirs: src
   dependencies:
+  - async
   - base >= 4.7 && < 5
   - brick
-  - vty
-  - directory
+  - bytestring
   - cursor
   - cursor-brick
+  - directory
   - path
   - path-io
+  - text
+  - typed-process
+  - vty
 
 executables:
   archivist:
