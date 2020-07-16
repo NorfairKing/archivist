@@ -11,6 +11,9 @@ library:
   - vty
   - directory
   - cursor
+  - cursor-brick
+  - path
+  - path-io
 
 executables:
   archivist:

@@ -1,7 +1,4 @@
-resolver: lts-12.18
+resolver: lts-15.15
 packages:
 - .
-extra-deps:
-- cursor-0.0.0.1
-- validity-0.8.0.0
 

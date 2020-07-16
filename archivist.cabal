@@ -4,7 +4,7 @@ cabal-version: 1.12
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: 59eb5b0de27f62f844ac751f3492a15df94f87f210069f4667ed919fbcf0c537
+-- hash: be4ceb38dff310c1482248038fcef2a43e7bcd85925666ef2c6c51fe30193bcd
 
 name:           archivist
 version:        0.0.0.0
@@ -29,7 +29,10 @@ library
       base >=4.7 && <5
     , brick
     , cursor
+    , cursor-brick
     , directory
+    , path
+    , path-io
     , vty
   default-language: Haskell2010
 
