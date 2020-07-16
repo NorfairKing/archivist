@@ -22,6 +22,7 @@ import qualified Data.ByteString as SB
 import Data.ByteString (ByteString)
 import qualified Data.List.NonEmpty as NE
 import Data.Maybe
+import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.Encoding.Error as TE
 import Graphics.Vty as Vty
@@ -71,7 +72,7 @@ data ArchivistEvent
   deriving (Show, Eq)
 
 data ResourceName
-  = ResourceName
+  = OutputViewport
   deriving (Show, Eq, Ord)
 
 data ArchivistButton
@@ -124,15 +125,15 @@ buildInitialState Settings {..} = do
 
 drawTui :: State -> [Widget ResourceName]
 drawTui State {..} =
-  concat
-    [ [scanProcessWidget sp | sp <- maybeToList stateScanProcess],
-      [ vBox
-          [ padBottom Max $ padRight Max $ padAll 1 $ nurseryWidget (selectedIf (stateSelection == NurserySelection)) stateNursery,
-            hBorder,
-            vLimit 5 $ buttonsWidget (selectedIf (stateSelection == ButtonSelection)) stateButtons
-          ]
-      ]
-    ]
+  [ vBox $
+      concat
+        [ [ padBottom Max $ padRight Max $ padAll 1 $ nurseryWidget (selectedIf (stateSelection == NurserySelection)) stateNursery,
+            hBorder
+          ],
+          [vLimitPercent 25 $ scanProcessWidget sp | sp <- maybeToList stateScanProcess],
+          [vLimit 5 $ buttonsWidget (selectedIf (stateSelection == ButtonSelection)) stateButtons]
+        ]
+  ]
 
 nurseryWidget :: Selected -> Maybe (NonEmptyCursor (Path Rel File)) -> Widget n
 nurseryWidget s = maybe (str "No files") $ verticalNonEmptyCursorWidget (go NotSelected) (go s) (go NotSelected)
@@ -153,8 +154,14 @@ buttonsWidget s = horizontalNonEmptyCursorWidget (go NotSelected) (go s) (go Not
     go :: Selected -> ArchivistButton -> Widget n
     go s = padAll 1 . border . select s . str . show
 
-scanProcessWidget :: ScanProcess -> Widget n
-scanProcessWidget ScanProcess {..} = centerLayer $ border $ padAll 1 $ txtWrap $ TE.decodeUtf8With TE.lenientDecode scanProcessOutputSoFar
+scanProcessWidget :: ScanProcess -> Widget ResourceName
+scanProcessWidget ScanProcess {..} =
+  centerLayer $ border $ padAll 1 $ viewport OutputViewport Vertical $
+    let ls = T.lines $ TE.decodeUtf8With TE.lenientDecode scanProcessOutputSoFar
+        go [] = []
+        go [t] = [visible t]
+        go (t : ts) = t : go ts
+     in vBox $ go $ map txtWrap ls
 
 handleTuiEvent :: Settings -> State -> BrickEvent n ArchivistEvent -> EventM n (Next State)
 handleTuiEvent sets s be =
