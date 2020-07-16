@@ -150,7 +150,7 @@ errAttr = "error"
 buildInitialState :: Settings -> IO State
 buildInitialState Settings {..} = do
   mfs <- forgivingAbsence $ snd <$> listDirRecurRel setNurseryDir
-  let mnec = makeNonEmptyCursor <$> (mfs >>= NE.nonEmpty)
+  let mnec = makeNonEmptyCursor <$> (mfs >>= (NE.nonEmpty . sort))
   pure
     State
       { stateNursery = mnec,
@@ -178,7 +178,7 @@ drawTui State {..} =
           [ vLimit 5 $
               hBox
                 [ scanButtonWidget (selectedIf (stateSelection == ScanButtonSelection)) stateMode stateScanText,
-                  combineButtonWidget (selectedIf (stateSelection == CombineButtonSelection)) stateMode stateScanText
+                  combineButtonWidget (selectedIf (stateSelection == CombineButtonSelection)) stateMode stateCombineText
                 ]
           ]
         ]
@@ -288,7 +288,7 @@ handleTuiEvent sets s be =
                           Just rf -> do
                             let af = setNurseryDir sets </> rf
                             ignoringAbsence $ removeFile af
-                            modNurseryDOU nonEmptyCursorRemoveElem
+                            modNurseryDOU nonEmptyCursorDeleteElem
                         EvKey (KChar 'e') [] -> case mcf of
                           Nothing -> err "No file to move out"
                           Just rf -> do
@@ -360,7 +360,7 @@ handleTuiEvent sets s be =
                             Nothing -> err "Not a valid file to combine to"
                             Just rf -> do
                               liftIO $ combineFiles sets rf ne
-                              refreshNursery sets s >>= continue
+                              refreshNursery sets (s {stateCombineText = emptyTextCursor}) >>= continue
                     _ -> handleTextCursor (\s tc' -> s {stateCombineText = tc'}) (stateCombineText s) vtye
         _ -> continue s
 
@@ -369,7 +369,7 @@ refreshNursery Settings {..} s = do
   mfs <- forgivingAbsence $ snd <$> listDirRecurRel setNurseryDir
   pure
     s
-      { stateNursery = makeNonEmptyCursor <$> (mfs >>= NE.nonEmpty)
+      { stateNursery = makeNonEmptyCursor <$> (mfs >>= (NE.nonEmpty . sort))
       }
 
 -- TODO make sure that the process is stopped
