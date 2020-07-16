@@ -202,6 +202,14 @@ handleTuiEvent sets s be =
                   mcf = nonEmptyCursorCurrent <$> stateNursery s
                in case vtye of
                     EvKey (KChar 'q') [] -> halt s
+                    EvKey (KChar 'c') [] -> case mcf of
+                      Nothing -> continue s
+                      Just rf ->
+                        if (fileExtension rf == Just ".pdf")
+                          then continue s
+                          else do
+                            liftIO $ convertFile $ setNurseryDir sets </> rf
+                            refreshNursery sets s >>= continue
                     EvKey (KChar 'r') [] -> refreshNursery sets s >>= continue
                     EvKey KDown [] -> modNurseryM nonEmptyCursorSelectNext
                     EvKey (KChar 'j') [] -> modNurseryM nonEmptyCursorSelectNext
@@ -358,3 +366,9 @@ tryToFinishScanProcess s = case stateScanProcess s of
           void $ waitExitCode p
           void $ wait $ scanProcessChecker sp
         pure $ s {stateScanProcess = Nothing}
+
+convertFile :: Path Abs File -> IO ()
+convertFile inf = do
+  case replaceExtension ".pdf" inf of
+    Nothing -> pure ()
+    Just outf -> void $ runProcess $ proc "convert" [fromAbsFile inf, fromAbsFile outf]
