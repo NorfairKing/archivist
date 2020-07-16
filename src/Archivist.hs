@@ -37,6 +37,7 @@ import Graphics.Vty.Input.Events
 import Lens.Micro
 import Path
 import Path.IO
+import System.Exit
 import System.IO
 import System.Process.Typed
 
@@ -44,8 +45,9 @@ archivist :: IO ()
 archivist = do
   home <- getHomeDir
   nurseryDir <- resolveDir home ".archivist"
+  outDir <- resolveDir home "scans"
   chan <- newBChan 100
-  let sets = Settings {setChan = chan, setNurseryDir = nurseryDir}
+  let sets = Settings {setChan = chan, setNurseryDir = nurseryDir, setOutDir = outDir}
   initialState <- buildInitialState sets
   -- Start the app
   let builder = Vty.mkVty Vty.defaultConfig
@@ -55,7 +57,8 @@ archivist = do
 data Settings
   = Settings
       { setChan :: BChan ArchivistEvent,
-        setNurseryDir :: Path Abs Dir
+        setNurseryDir :: Path Abs Dir,
+        setOutDir :: Path Abs Dir
       }
 
 data State
@@ -78,6 +81,7 @@ data ScanProcess
 
 data ArchivistEvent
   = EventCheckProcess
+  | EventEndProcess
   deriving (Show, Eq)
 
 data ResourceName
@@ -237,7 +241,10 @@ handleTuiEvent sets s be =
   let err str = continue $ s {stateError = Just str}
    in case be of
         AppEvent ae -> case ae of
-          EventCheckProcess -> checkProcess s
+          EventCheckProcess -> checkProcess sets s
+          EventEndProcess -> do
+            liftIO $ convertToPdfs (setNurseryDir sets)
+            refreshNursery sets (s {stateSelection = NurserySelection, stateMode = NormalMode}) >>= continue
         VtyEvent vtye ->
           let setSelection sel = continue $ s {stateSelection = sel}
               setMode m = continue $ s {stateMode = m}
@@ -252,26 +259,35 @@ handleTuiEvent sets s be =
                         EvKey (KChar 'q') [] -> halt s
                         EvKey (KChar 's') [] -> setSelection ButtonSelection
                         EvKey (KChar 'c') [] -> setSelection ButtonSelection
-                        EvKey (KChar 'p') [] -> case mcf of
-                          Nothing -> err "No file to convert to a pdf"
-                          Just rf ->
-                            if (fileExtension rf == Just ".pdf")
-                              then err "The file to convert is already a pdf"
-                              else do
-                                liftIO $ convertFile $ setNurseryDir sets </> rf
-                                refreshNursery sets s >>= continue
+                        EvKey (KChar 'p') [] -> do
+                          liftIO $ convertToPdfs (setNurseryDir sets)
+                          refreshNursery sets s >>= continue
                         EvKey (KChar 'r') [] -> refreshNursery sets s >>= continue
                         EvKey KDown [] -> modNurseryM nonEmptyCursorSelectNext
                         EvKey (KChar 'j') [] -> modNurseryM nonEmptyCursorSelectNext
                         EvKey KUp [] -> modNurseryM nonEmptyCursorSelectPrev
                         EvKey (KChar 'k') [] -> modNurseryM nonEmptyCursorSelectPrev
                         EvKey (KChar '\t') [] -> setSelection ButtonSelection
-                        EvKey (KChar 'd') [] -> case mcf of
+                        EvKey (KChar 'D') [] -> case mcf of
                           Nothing -> err "No file to delete"
                           Just rf -> do
                             let af = setNurseryDir sets </> rf
                             ignoringAbsence $ removeFile af
                             modNurseryDOU nonEmptyCursorRemoveElem
+                        EvKey (KChar 'e') [] -> case mcf of
+                          Nothing -> err "No file to move out"
+                          Just rf -> do
+                            let inf = setNurseryDir sets </> rf
+                                outf = setOutDir sets </> rf
+                            ensureDir $ parent outf
+                            renameFile inf outf
+                            modNurseryDOU nonEmptyCursorRemoveElem
+                        EvKey (KChar 'o') [] -> case mcf of
+                          Nothing -> err "No file to open"
+                          Just rf -> do
+                            liftIO $ openPdfFile $ setNurseryDir sets </> rf
+                            continue s
+                        EvKey KEsc [] -> continue $ s {stateSelectedFiles = Nothing}
                         EvKey KEnter [] ->
                           case mcf of
                             Nothing -> err "No selected files."
@@ -282,7 +298,7 @@ handleTuiEvent sets s be =
                                   Just ne ->
                                     if cf `elem` NE.toList ne
                                       then s {stateSelectedFiles = NE.nonEmpty $ NE.filter (/= cf) ne}
-                                      else s {stateSelectedFiles = Just $ NE.cons cf ne}
+                                      else s {stateSelectedFiles = Just $ ne <> (cf :| [])}
                                 else err "Cannot select a non-pdf file."
                         _ -> continue s
                 ButtonSelection ->
@@ -402,15 +418,15 @@ processEventSender chan p = go
           go
         Just _ -> writeBChan chan EventCheckProcess -- The last one.
 
-checkProcess :: State -> EventM n (Next State)
-checkProcess s = case stateScanProcess s of
+checkProcess :: Settings -> State -> EventM n (Next State)
+checkProcess sets s = case stateScanProcess s of
   Nothing -> continue s
   Just sp -> do
     let p = scanProcess sp
     sp' <- addFrom (getStdout p) sp
     sp'' <- addFrom (getStderr p) sp'
     let s' = s {stateScanProcess = Just sp''}
-    tryToFinishScanProcess s' >>= continue
+    tryToFinishScanProcess sets s' >>= continue
   where
     addFrom h sp = do
       msp' <- addPiece sp
@@ -426,8 +442,8 @@ checkProcess s = case stateScanProcess s of
               else Just $ sp {scanProcessOutputSoFar = scanProcessOutputSoFar sp <> out}
     chunkSize = 1024
 
-tryToFinishScanProcess :: State -> EventM n State
-tryToFinishScanProcess s = case stateScanProcess s of
+tryToFinishScanProcess :: Settings -> State -> EventM n State
+tryToFinishScanProcess Settings {..} s = case stateScanProcess s of
   Nothing -> pure s
   Just sp -> do
     let p = scanProcess sp
@@ -438,13 +454,27 @@ tryToFinishScanProcess s = case stateScanProcess s of
         liftIO $ do
           void $ waitExitCode p
           void $ wait $ scanProcessChecker sp
+          writeBChan setChan EventEndProcess
         pure $ s {stateScanProcess = Nothing}
+
+openPdfFile :: Path Abs File -> IO ()
+openPdfFile f = withProcessWait (setStderr nullStream $ setStdout nullStream $ setStdin nullStream $ proc "evince" [fromAbsFile f]) $ const $ pure ()
+
+convertToPdfs :: Path Abs Dir -> IO ()
+convertToPdfs dir = do
+  fs <- snd <$> listDirRecur dir
+  let pdfs = filter (\f -> fileExtension f /= Just ".pdf") fs
+  mapM_ convertFile pdfs
 
 convertFile :: Path Abs File -> IO ()
 convertFile inf = do
   case replaceExtension ".pdf" inf of
     Nothing -> pure ()
-    Just outf -> void $ runProcess $ proc "convert" [fromAbsFile inf, fromAbsFile outf]
+    Just outf -> do
+      ec <- runProcess $ proc "convert" [fromAbsFile inf, fromAbsFile outf]
+      case ec of
+        ExitSuccess -> removeFile inf
+        ExitFailure _ -> pure ()
 
 combineFiles :: Settings -> Path Rel File -> NonEmpty (Path Rel File) -> IO ()
 combineFiles Settings {..} outFile inFiles = do
